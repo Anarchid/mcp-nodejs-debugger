@@ -11,7 +11,7 @@ console.error = function() {};
 // Create an MCP server
 const server = new McpServer({
   name: "NodeJS Debugger",
-  version: "0.2.2",
+  version: "0.3.0",
   description: `Advanced Node.js debugger for runtime analysis and troubleshooting. This tool connects to Node.js's built-in Inspector Protocol to provide powerful debugging capabilities directly through Claude Code.
 
     DEBUGGING STRATEGY:
@@ -20,10 +20,15 @@ const server = new McpServer({
     - When you need to test potential fixes for the application
     - When you need to explore the codebase to find the root cause of an issue
 
+    CONNECTION MANAGEMENT:
+    - Use 'get_connection_status' to check current connection state
+    - Use 'disconnect' after completing a debug session - this allows the debugged process to exit cleanly
+    - Use 'connect' to establish a new connection after disconnect, or to connect to a different debug port
+    - Use 'retry_connect' if connection drops unexpectedly
 
     IMPORTANT NOTES:
     - ALWAYS assume the user has already started their Node.js application in debug mode.
-    - If connection issues occur, suggest using retry_connect tool instead of restarting the server
+    - When a fix requires restarting the app: 1) use disconnect, 2) restart the app or tell the user to do so as appropriate, 3) use connect
     - Don't try to start the debugger or the node server yourself.
     - Always ask the user to trigger breakpoints manually, give them specific instructions on how to do so.
     - When user interaction is required, provide EXTREMELY specific instructions
@@ -46,6 +51,7 @@ class Inspector {
 		this.retryCount = 0;
 		this.callbackHandlers = new Map();
 		this.continuousRetryEnabled = retryOptions.continuousRetry;
+		this.reconnectEnabled = true; // Controls whether auto-reconnect is active
 		this.initialize();
 	}
 
@@ -108,15 +114,20 @@ class Inspector {
 	}
 	
 	scheduleRetry() {
+		// Don't retry if reconnection is disabled (e.g., after explicit disconnect)
+		if (!this.reconnectEnabled) {
+			return;
+		}
+
 		// If continuous retry is enabled, we'll keep trying after the initial attempts
 		if (this.retryCount < this.retryOptions.maxRetries || this.continuousRetryEnabled) {
 			this.retryCount++;
-			
+
 			// Use a longer interval for continuous retries to reduce resource usage
 			const interval = this.continuousRetryEnabled && this.retryCount > this.retryOptions.maxRetries
 				? Math.min(this.retryOptions.retryInterval * 5, 10000) // Max 10 seconds between retries
 				: this.retryOptions.retryInterval;
-				
+
 			setTimeout(() => this.initialize(), interval);
 		}
 	}
@@ -315,6 +326,35 @@ class Inspector {
 		} catch (err) {
 			throw err;
 		}
+	}
+
+	disconnect() {
+		// Disable automatic reconnection
+		this.reconnectEnabled = false;
+
+		// Close the WebSocket connection if it exists
+		if (this.ws) {
+			this.ws.close();
+		}
+
+		// Reset state
+		this.connected = false;
+		this.debuggerEnabled = false;
+		this.paused = false;
+		this.currentCallFrames = [];
+		this.breakpoints.clear();
+		this.pendingRequests.clear();
+	}
+
+	getStatus() {
+		return {
+			connected: this.connected,
+			debuggerEnabled: this.debuggerEnabled,
+			port: this.port,
+			paused: this.paused,
+			reconnectEnabled: this.reconnectEnabled,
+			activeBreakpoints: this.breakpoints.size
+		};
 	}
 }
 
@@ -1136,18 +1176,21 @@ server.tool(
       if (port && port !== inspector.port) {
         inspector.port = port;
       }
-      
+
       // If already connected, disconnect first
       if (inspector.connected && inspector.ws) {
         inspector.ws.close();
         inspector.connected = false;
 		inspector.debuggerEnabled = false;
       }
-      
+
+      // Re-enable reconnection (in case it was disabled by disconnect)
+      inspector.reconnectEnabled = true;
+
       // Reset retry count and initialize
       inspector.retryCount = 0;
       inspector.initialize();
-      
+
       return {
         content: [{
           type: "text",
@@ -1159,6 +1202,111 @@ server.tool(
         content: [{
           type: "text",
           text: `Error initiating connection retry: ${err.message}`
+        }]
+      };
+    }
+  }
+);
+
+// Disconnect from the Node.js debugger
+server.tool(
+  "disconnect",
+  "Disconnects from the Node.js debugger and stops automatic reconnection. Leaving connected inspector sessions block exit on inspected app, so use this after completing a debug session to let the app exit cleanly.",
+  {},
+  async () => {
+    try {
+      const wasConnected = inspector.connected;
+      inspector.disconnect();
+
+      return {
+        content: [{
+          type: "text",
+          text: wasConnected
+            ? "Disconnected from debugger. Automatic reconnection disabled. Use 'connect' tool to reconnect when ready."
+            : "Debugger was not connected. Automatic reconnection disabled."
+        }]
+      };
+    } catch (err) {
+      return {
+        content: [{
+          type: "text",
+          text: `Error disconnecting: ${err.message}`
+        }]
+      };
+    }
+  }
+);
+
+// Connect to a Node.js debugger on a specific port
+server.tool(
+  "connect",
+  "Connects to a Node.js debugger on the specified port. Use this to establish a new connection after using disconnect, or to connect to a different Node.js process.",
+  {
+    port: z.number().optional().describe("Port to connect to. Defaults to 9229 (Node.js default debug port)")
+  },
+  async ({ port = 9229 }) => {
+    try {
+      // Update the port
+      inspector.port = port;
+
+      // If already connected, disconnect first (but don't disable reconnection)
+      if (inspector.connected && inspector.ws) {
+        inspector.ws.close();
+        inspector.connected = false;
+        inspector.debuggerEnabled = false;
+      }
+
+      // Enable reconnection
+      inspector.reconnectEnabled = true;
+
+      // Reset retry count and initialize
+      inspector.retryCount = 0;
+      inspector.initialize();
+
+      return {
+        content: [{
+          type: "text",
+          text: `Connecting to Node.js debugger on port ${port}...`
+        }]
+      };
+    } catch (err) {
+      return {
+        content: [{
+          type: "text",
+          text: `Error connecting: ${err.message}`
+        }]
+      };
+    }
+  }
+);
+
+// Get current connection status
+server.tool(
+  "get_connection_status",
+  "Returns the current debugger connection status including port, connection state, and whether automatic reconnection is enabled.",
+  {},
+  async () => {
+    try {
+      const status = inspector.getStatus();
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            connected: status.connected,
+            port: status.port,
+            debuggerEnabled: status.debuggerEnabled,
+            paused: status.paused,
+            reconnectEnabled: status.reconnectEnabled,
+            activeBreakpoints: status.activeBreakpoints
+          }, null, 2)
+        }]
+      };
+    } catch (err) {
+      return {
+        content: [{
+          type: "text",
+          text: `Error getting status: ${err.message}`
         }]
       };
     }
